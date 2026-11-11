@@ -1,15 +1,29 @@
 {
   "WebhookPlus": {
     "name": "Webhook增强版",
-    "description": "事件发生时向第三方地址发送请求，支持自定义请求头（如鉴权 Token）和按事件类型过滤。",
+    "description": "事件发生时向第三方地址发送请求，支持自定义请求头（如鉴权 Token）、按事件类型和标题过滤。",
     "labels": "消息通知",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/lddcc/MoviePilot-Plugins/main/icons/webhookplus.png",
     "author": "lddcc",
     "level": 1,
     "system_version": ">=3.2.0",
     "history": {
+      "v1.1.0": "新增标题包含 / 排除正则过滤（只作用于带 title 的事件，如 notice.message），过滤在序列化前完成；改为异步发送，复用宿主共享连接池，不再占用事件线程池；发送记录显示通知标题。",
       "v1.0.0": "基于官方 Webhook 插件：新增自定义请求头、事件类型过滤、超时设置和发送记录页；序列化事件数据时不再原地改写原事件对象。"
+    }
+  },
+  "DaguPanel": {
+    "name": "Dagu任务面板",
+    "description": "在仪表板和详情页查看 Dagu 任务的最近运行状态、结果摘要和下次运行时间，并可一键立即运行。",
+    "labels": "工具",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/lddcc/MoviePilot-Plugins/main/icons/dagupanel.png",
+    "author": "lddcc",
+    "level": 1,
+    "system_version": ">=3.2.0",
+    "history": {
+      "v1.0.0": "首个版本：仪表板组件 + 详情页运行记录表，「立即运行」走 Dagu 排队接口；数据按需拉取并走宿主缓存（Redis），已结束运行的摘要只取一次。"
     }
   }
 }

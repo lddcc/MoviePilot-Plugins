@@ -1,5 +1,7 @@
+import asyncio
 import dataclasses
 import json
+import re
 from datetime import date, datetime
 from enum import Enum
 from pathlib import PurePath
@@ -8,7 +10,7 @@ from typing import Any
 from app.schemas.types import EventType
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
-from app.sdk.network import RequestUtils
+from app.sdk.network import AsyncRequestUtils
 from app.sdk.plugin import _PluginBase
 
 # 详情页保留的最近发送记录条数
@@ -21,9 +23,9 @@ class WebhookPlus(_PluginBase):
     """事件发生时向第三方地址发送请求，支持自定义请求头和事件过滤。"""
 
     plugin_name = "Webhook增强版"
-    plugin_desc = "事件发生时向第三方地址发送请求，支持自定义请求头（如鉴权 Token）和按事件类型过滤。"
+    plugin_desc = "事件发生时向第三方地址发送请求，支持自定义请求头（如鉴权 Token）、按事件类型和标题过滤。"
     plugin_icon = "https://raw.githubusercontent.com/lddcc/MoviePilot-Plugins/main/icons/webhookplus.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_label = "消息通知"
     plugin_author = "lddcc"
     author_url = "https://github.com/lddcc"
@@ -37,6 +39,10 @@ class WebhookPlus(_PluginBase):
     _headers: dict[str, str] = {}
     _event_types: list[str] = []
     _timeout = 10
+    _title_include: re.Pattern | None = None
+    _title_exclude: re.Pattern | None = None
+    _requester: AsyncRequestUtils | None = None
+    _history_lock: asyncio.Lock | None = None
 
     def init_plugin(self, config: dict | None = None) -> None:
         """读取配置；可重复调用。"""
@@ -50,6 +56,12 @@ class WebhookPlus(_PluginBase):
             self._timeout = max(1, int(config.get("timeout") or 10))
         except (TypeError, ValueError):
             self._timeout = 10
+        self._title_include = self._compile(config.get("title_include"), "标题包含")
+        self._title_exclude = self._compile(config.get("title_exclude"), "标题排除")
+        # 底层连接池由宿主共享，这里只保存请求头和超时等选项，复用即可
+        self._requester = AsyncRequestUtils(headers=self._headers or None, timeout=self._timeout,
+                                            content_type="application/json")
+        self._history_lock = asyncio.Lock()
 
     def get_state(self) -> bool:
         """返回插件是否启用。"""
@@ -149,6 +161,39 @@ class WebhookPlus(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "title_include",
+                                            "label": "标题包含（正则，留空不限）",
+                                            "placeholder": "【115网盘】.*(STRM|删除)",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "title_exclude",
+                                            "label": "标题排除（正则，留空不限）",
+                                            "placeholder": "失败|异常",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -177,7 +222,9 @@ class WebhookPlus(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": "POST 以 JSON 发送 {\"type\": 事件类型, \"data\": 事件数据}；"
-                                                    "GET 以查询参数 type 和 data（JSON 字符串）发送。",
+                                                    "GET 以查询参数 type 和 data（JSON 字符串）发送。"
+                                                    "标题过滤只作用于带 title 的事件（如 notice.message），"
+                                                    "其它事件不受影响。",
                                         },
                                     }
                                 ],
@@ -192,6 +239,8 @@ class WebhookPlus(_PluginBase):
             "webhook_url": "",
             "timeout": 10,
             "event_types": [],
+            "title_include": "",
+            "title_exclude": "",
             "headers": "",
         }
 
@@ -239,30 +288,35 @@ class WebhookPlus(_PluginBase):
         ]
 
     @eventmanager.register(EventType)
-    def send(self, event: Event) -> None:
-        """把事件发送到第三方地址。"""
-        if not self._enabled or not self._webhook_url:
+    async def send(self, event: Event) -> None:
+        """把事件发送到第三方地址；协程在宿主主事件循环上执行，不占用线程池。"""
+        if not self._enabled or not self._webhook_url or not self._requester:
             return
         if not event or not event.event_type:
             return
         event_type = event.event_type.value if isinstance(event.event_type, Enum) else str(event.event_type)
         if self._event_types and event_type not in self._event_types:
             return
+        # 先按标题过滤再序列化，被过滤掉的事件不做任何额外开销
+        title = self._get_title(event.event_data)
+        if title is not None:
+            if self._title_include and not self._title_include.search(title):
+                return
+            if self._title_exclude and self._title_exclude.search(title):
+                return
 
-        event_info = {"type": event_type, "data": self._to_jsonable(event.event_data)}
-        requester = RequestUtils(headers=self._headers or None, timeout=self._timeout,
-                                 content_type="application/json")
+        data = self._to_jsonable(event.event_data)
         try:
             if self._method == "POST":
-                ret = requester.post_res(self._webhook_url, json=event_info)
+                ret = await self._requester.post_res(self._webhook_url, json={"type": event_type, "data": data})
             else:
-                ret = requester.get_res(self._webhook_url, params={
+                ret = await self._requester.get_res(self._webhook_url, params={
                     "type": event_type,
-                    "data": json.dumps(event_info["data"], ensure_ascii=False),
+                    "data": json.dumps(data, ensure_ascii=False),
                 })
             if ret is None:
                 ok, result = False, "请求失败，未获取到返回信息"
-            elif ret.ok:
+            elif 200 <= ret.status_code < 300:
                 ok, result = True, f"HTTP {ret.status_code}"
             else:
                 ok, result = False, f"HTTP {ret.status_code} {ret.text[:200]}"
@@ -273,11 +327,29 @@ class WebhookPlus(_PluginBase):
             logger.info(f"Webhook 发送成功：{event_type} -> {result}")
         else:
             logger.error(f"Webhook 发送失败：{event_type} -> {result}")
-        self._append_history(event_type, ok, result)
+        await self._append_history(event_type if title is None else f"{event_type}：{title}", ok, result)
 
     def stop_service(self) -> None:
-        """没有后台资源需要释放。"""
-        return None
+        """请求连接池由宿主共享管理，无需释放。"""
+        self._requester = None
+
+    @staticmethod
+    def _compile(pattern: Any, name: str) -> re.Pattern | None:
+        """编译过滤正则；留空返回 None，写错时记日志并视为不过滤。"""
+        pattern = str(pattern or "").strip()
+        if not pattern:
+            return None
+        try:
+            return re.compile(pattern)
+        except re.error as e:
+            logger.error(f"Webhook {name}正则无效，已忽略：{pattern} -> {e}")
+            return None
+
+    @staticmethod
+    def _get_title(data: Any) -> str | None:
+        """取事件数据里的 title（字典键或对象属性），没有则返回 None。"""
+        title = data.get("title") if isinstance(data, dict) else getattr(data, "title", None)
+        return title if isinstance(title, str) and title else None
 
     @staticmethod
     def _parse_headers(text: Any) -> dict[str, str]:
@@ -332,16 +404,17 @@ class WebhookPlus(_PluginBase):
                 {k: v for k, v in vars(obj).items() if not k.startswith("_")}, depth + 1, seen)
         return str(obj)
 
-    def _append_history(self, event_type: str, ok: bool, result: str) -> None:
-        """追加一条发送记录，只保留最近 HISTORY_LIMIT 条。"""
+    async def _append_history(self, event_type: str, ok: bool, result: str) -> None:
+        """追加一条发送记录，只保留最近 HISTORY_LIMIT 条；加锁避免并发事件互相覆盖。"""
         try:
-            history = self.get_data("history") or []
-            history.append({
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "type": event_type,
-                "ok": ok,
-                "result": result,
-            })
-            self.save_data("history", history[-HISTORY_LIMIT:])
+            async with self._history_lock:
+                history = await self.async_get_data("history") or []
+                history.append({
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "type": event_type,
+                    "ok": ok,
+                    "result": result,
+                })
+                await self.async_save_data("history", history[-HISTORY_LIMIT:])
         except Exception as e:
             logger.warning(f"保存 Webhook 发送记录失败：{e}")
