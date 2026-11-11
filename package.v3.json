@@ -1,0 +1,15 @@
+{
+  "WebhookPlus": {
+    "name": "Webhook增强版",
+    "description": "事件发生时向第三方地址发送请求，支持自定义请求头（如鉴权 Token）和按事件类型过滤。",
+    "labels": "消息通知",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/lddcc/MoviePilot-Plugins/main/icons/webhookplus.png",
+    "author": "lddcc",
+    "level": 1,
+    "system_version": ">=3.2.0",
+    "history": {
+      "v1.0.0": "基于官方 Webhook 插件：新增自定义请求头、事件类型过滤、超时设置和发送记录页；序列化事件数据时不再原地改写原事件对象。"
+    }
+  }
+}
